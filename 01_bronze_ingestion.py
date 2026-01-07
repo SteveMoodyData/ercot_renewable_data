@@ -343,9 +343,24 @@ def write_to_bronze(
 
 # COMMAND ----------
 
+def table_exists(table_name: str) -> bool:
+    """Check if a table exists in the catalog."""
+    full_table_name = f"{CATALOG}.{SCHEMA_BRONZE}.{table_name}"
+    try:
+        spark.sql(f"DESCRIBE TABLE {full_table_name}")
+        return True
+    except Exception:
+        return False
+
+
 def get_last_loaded_date(table_name: str) -> Optional[datetime]:
     """Get the most recent date loaded for incremental processing."""
     full_table_name = f"{CATALOG}.{SCHEMA_BRONZE}.{table_name}"
+    
+    # First check if table exists
+    if not table_exists(table_name):
+        print(f"Table {full_table_name} does not exist yet - will perform initial load")
+        return None
     
     try:
         result = spark.sql(f"""
@@ -356,7 +371,7 @@ def get_last_loaded_date(table_name: str) -> Optional[datetime]:
         if result and result[0]["max_date"]:
             return result[0]["max_date"]
     except Exception as e:
-        print(f"Table {full_table_name} not found or empty: {e}")
+        print(f"Could not get last loaded date from {full_table_name}: {e}")
     
     return None
 
@@ -505,11 +520,18 @@ def run_bronze_quality_checks(table_name: str) -> dict:
     """Run basic quality checks on bronze table."""
     full_table_name = f"{CATALOG}.{SCHEMA_BRONZE}.{table_name}"
     
+    # Check if table exists first
+    if not table_exists(table_name):
+        return {"status": "table_not_found"}
+    
     checks = {}
     
     # Row count
     count = spark.sql(f"SELECT COUNT(*) as cnt FROM {full_table_name}").collect()[0]["cnt"]
     checks["row_count"] = count
+    
+    if count == 0:
+        return checks
     
     # Date range
     date_range = spark.sql(f"""
