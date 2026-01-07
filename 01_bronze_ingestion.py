@@ -332,7 +332,6 @@ def ingest_fuel_mix(
 
 
 def ingest_load_forecast(
-    api: ErcotAPI,
     start_date: str,
     end_date: Optional[str] = None,
     verbose: bool = False
@@ -340,9 +339,11 @@ def ingest_load_forecast(
     """
     Ingest 7-day load forecast by weather zone.
     
-    Returns DataFrame with load forecasts broken down by weather zone.
+    Uses the Ercot class (web scraping) since ErcotAPI doesn't have this method.
+    Returns DataFrame with load forecasts broken down by forecast zone.
     """
-    df = api.get_load_forecast(
+    ercot = Ercot()
+    df = ercot.get_load_forecast(
         date=start_date,
         end=end_date,
         verbose=verbose
@@ -352,8 +353,8 @@ def ingest_load_forecast(
     df.columns = [col.replace(" ", "_").replace("(", "").replace(")", "") for col in df.columns]
     
     df["_ingested_at"] = datetime.utcnow()
-    df["_source"] = "ercot_api"
-    df["_endpoint"] = "/np3-565-cd/lf_by_model_weather_zone"
+    df["_source"] = "ercot_web"
+    df["_endpoint"] = "load_forecast"
     
     return df
 
@@ -529,7 +530,7 @@ def run_bronze_ingestion():
             elif source_key == "wind_hourly_regional":
                 df = ingest_wind_hourly_regional(api, start_date, end_date, verbose=True)
             elif source_key == "load_forecast":
-                df = ingest_load_forecast(api, start_date, end_date, verbose=True)
+                df = ingest_load_forecast(start_date, end_date, verbose=True)
             elif source_key == "fuel_mix":
                 df = ingest_fuel_mix(verbose=True)
             else:
