@@ -452,8 +452,8 @@ def write_to_bronze(
     mode: str = "append"
 ) -> None:
     """
-    Write pandas DataFrame to Bronze Delta table.
-    
+    Write pandas DataFrame to Bronze Delta table using MERGE for deduplication.
+
     Args:
         df: Source pandas DataFrame
         table_name: Target table name (without catalog/schema)
@@ -462,7 +462,7 @@ def write_to_bronze(
     """
     # Convert to Spark DataFrame
     spark_df = spark.createDataFrame(df)
-    
+
     # Add partition columns if time-based (columns now have underscores)
     if "Interval_Start" in spark_df.columns:
         spark_df = (
@@ -478,22 +478,84 @@ def write_to_bronze(
             .withColumn("month", month(col("Time")))
             .withColumn("day", dayofmonth(col("Time")))
         )
-    
+
     # Full table path
     full_table_name = f"{CATALOG}.{SCHEMA_BRONZE}.{table_name}"
-    
-    # Write to Delta
-    (
-        spark_df
-        .write
-        .format("delta")
-        .mode(mode)
-        .partitionBy(*partition_cols)
-        .option("mergeSchema", "true")
-        .saveAsTable(full_table_name)
-    )
-    
-    print(f"✓ Wrote {len(df):,} rows to {full_table_name}")
+
+    # Define business keys for deduplication by table
+    # These keys uniquely identify a record and are used in MERGE logic
+    business_keys = {
+        "solar_hourly_actual_forecast": ["Interval_Start"],
+        "solar_hourly_actual_forecast_regional": ["Interval_Start", "Geographic_Region"],
+        "wind_hourly_actual_forecast": ["Interval_Start"],
+        "wind_hourly_actual_forecast_regional": ["Interval_Start", "Geographic_Region"],
+        "load_forecast_7day": ["Time", "PublishDate", "WeatherZone"],
+        "fuel_mix": ["Time"],
+        "lmp_by_settlement_point": ["Interval_Start", "Settlement_Point"],
+        "lmp_day_ahead_market": ["Interval_Start", "Location", "Market", "Location_Type"],
+    }
+
+    # Check if table exists and mode is append - if so, use MERGE
+    if table_exists(table_name) and mode == "append" and table_name in business_keys:
+        # Get business keys for this table
+        merge_keys = business_keys[table_name]
+
+        # Verify all merge keys exist in the DataFrame
+        missing_keys = [key for key in merge_keys if key not in spark_df.columns]
+        if missing_keys:
+            print(f"⚠ Warning: Merge keys {missing_keys} not found in DataFrame. Falling back to append.")
+            print(f"  Available columns: {spark_df.columns}")
+            # Fall back to regular append
+            (
+                spark_df
+                .write
+                .format("delta")
+                .mode(mode)
+                .partitionBy(*partition_cols)
+                .option("mergeSchema", "true")
+                .saveAsTable(full_table_name)
+            )
+        else:
+            # Create temp view for MERGE
+            temp_view = f"temp_{table_name}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+            spark_df.createOrReplaceTempView(temp_view)
+
+            # Build MERGE condition
+            merge_condition = " AND ".join([f"target.{key} = source.{key}" for key in merge_keys])
+
+            # Get all columns except partition columns (they'll be derived)
+            update_cols = [c for c in spark_df.columns if c not in ["year", "month", "day"]]
+            update_set = ", ".join([f"target.{col} = source.{col}" for col in update_cols])
+
+            # Execute MERGE
+            merge_sql = f"""
+                MERGE INTO {full_table_name} AS target
+                USING {temp_view} AS source
+                ON {merge_condition}
+                WHEN MATCHED THEN
+                    UPDATE SET {update_set}
+                WHEN NOT MATCHED THEN
+                    INSERT *
+            """
+
+            print(f"Executing MERGE with keys: {merge_keys}")
+            spark.sql(merge_sql)
+
+            # Get count of affected rows
+            count = spark.sql(f"SELECT COUNT(*) as cnt FROM {temp_view}").collect()[0]["cnt"]
+            print(f"✓ Merged {count:,} rows into {full_table_name}")
+    else:
+        # Initial load or overwrite mode - use regular write
+        (
+            spark_df
+            .write
+            .format("delta")
+            .mode(mode)
+            .partitionBy(*partition_cols)
+            .option("mergeSchema", "true")
+            .saveAsTable(full_table_name)
+        )
+        print(f"✓ Wrote {len(df):,} rows to {full_table_name}")
 
 # COMMAND ----------
 
@@ -660,6 +722,109 @@ for source, result in results.items():
         print(f"○ {source}: no data")
     else:
         print(f"✗ {source}: {error}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Deduplication Utilities
+# MAGIC
+# MAGIC Utilities to clean up existing duplicate data in bronze tables.
+
+# COMMAND ----------
+
+def deduplicate_bronze_table(table_name: str, business_keys: list) -> None:
+    """
+    Remove duplicates from an existing bronze table by keeping the most recent record.
+
+    Args:
+        table_name: Name of the bronze table (without catalog/schema)
+        business_keys: List of columns that uniquely identify a record
+    """
+    full_table_name = f"{CATALOG}.{SCHEMA_BRONZE}.{table_name}"
+
+    if not table_exists(table_name):
+        print(f"Table {full_table_name} does not exist")
+        return
+
+    print(f"Deduplicating {full_table_name}...")
+    print(f"  Business keys: {business_keys}")
+
+    from pyspark.sql.window import Window
+    from pyspark.sql.functions import row_number, desc
+
+    # Read current table
+    df = spark.table(full_table_name)
+
+    # Count before deduplication
+    count_before = df.count()
+    print(f"  Rows before deduplication: {count_before:,}")
+
+    # Create window to rank duplicates by ingestion time (most recent first)
+    window_spec = Window.partitionBy(*business_keys).orderBy(desc("_ingested_at"))
+
+    # Keep only the first row (most recent) for each business key combination
+    deduped_df = (
+        df
+        .withColumn("_row_num", row_number().over(window_spec))
+        .filter(col("_row_num") == 1)
+        .drop("_row_num")
+    )
+
+    # Count after deduplication
+    count_after = deduped_df.count()
+    duplicates_removed = count_before - count_after
+
+    print(f"  Rows after deduplication: {count_after:,}")
+    print(f"  Duplicates removed: {duplicates_removed:,}")
+
+    if duplicates_removed > 0:
+        # Backup the original table
+        backup_table = f"{full_table_name}_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        print(f"  Creating backup: {backup_table}")
+        spark.sql(f"CREATE TABLE {backup_table} AS SELECT * FROM {full_table_name}")
+
+        # Overwrite the original table with deduplicated data
+        print(f"  Overwriting {full_table_name} with deduplicated data...")
+
+        # Get partition columns from DATA_SOURCES
+        partition_cols = None
+        for source_key, config in DATA_SOURCES.items():
+            if config["table_name"] == table_name:
+                partition_cols = config["partition_cols"]
+                break
+
+        if partition_cols:
+            (
+                deduped_df
+                .write
+                .format("delta")
+                .mode("overwrite")
+                .partitionBy(*partition_cols)
+                .option("overwriteSchema", "true")
+                .saveAsTable(full_table_name)
+            )
+        else:
+            (
+                deduped_df
+                .write
+                .format("delta")
+                .mode("overwrite")
+                .option("overwriteSchema", "true")
+                .saveAsTable(full_table_name)
+            )
+
+        print(f"✓ Successfully deduplicated {full_table_name}")
+        print(f"  Backup saved to: {backup_table}")
+    else:
+        print(f"✓ No duplicates found in {full_table_name}")
+
+
+def deduplicate_lmp_dam():
+    """Convenience function to deduplicate the LMP Day-Ahead Market table."""
+    deduplicate_bronze_table(
+        table_name="lmp_day_ahead_market",
+        business_keys=["Interval_Start", "Location", "Market", "Location_Type"]
+    )
 
 # COMMAND ----------
 
