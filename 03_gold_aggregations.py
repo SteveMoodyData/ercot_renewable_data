@@ -535,6 +535,313 @@ def create_ml_features():
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC ## 5. LMP Price Analytics
+
+# COMMAND ----------
+
+def create_lmp_price_statistics():
+    """
+    Create comprehensive LMP price statistics.
+    
+    Tables created:
+    - lmp_daily_statistics: Daily price stats by hub/zone
+    - lmp_hourly_patterns: Average prices by hour of day
+    """
+    
+    lmp_df = spark.table(f"{CATALOG}.{SCHEMA_SILVER}.lmp_day_ahead_market")
+    
+    # === Daily Statistics by Settlement Point ===
+    daily_stats = (
+        lmp_df
+        .groupBy(
+            col("delivery_date").alias("date"),
+            "settlement_point",
+            "point_type"
+        )
+        .agg(
+            avg("lmp_price").alias("avg_price"),
+            spark_min("lmp_price").alias("min_price"),
+            spark_max("lmp_price").alias("max_price"),
+            expr("percentile(lmp_price, 0.25)").alias("p25_price"),
+            expr("percentile(lmp_price, 0.5)").alias("median_price"),
+            expr("percentile(lmp_price, 0.75)").alias("p75_price"),
+            stddev("lmp_price").alias("stddev_price"),
+            (spark_max("lmp_price") - spark_min("lmp_price")).alias("daily_range"),
+            count("*").alias("hours_count"),
+            # Peak vs off-peak
+            avg(when(col("is_peak_hour"), col("lmp_price"))).alias("avg_peak_price"),
+            avg(when(~col("is_peak_hour"), col("lmp_price"))).alias("avg_offpeak_price")
+        )
+        .withColumn("peak_offpeak_spread", col("avg_peak_price") - col("avg_offpeak_price"))
+        .withColumn("year", year(col("date")))
+        .withColumn("month", month(col("date")))
+    )
+    
+    (
+        daily_stats
+        .write
+        .format("delta")
+        .mode("overwrite")
+        .partitionBy("year", "month")
+        .option("overwriteSchema", "true")
+        .saveAsTable(f"{CATALOG}.{SCHEMA_GOLD}.lmp_daily_statistics")
+    )
+    
+    print(f"✓ Created {CATALOG}.{SCHEMA_GOLD}.lmp_daily_statistics")
+    
+    # === Hourly Price Patterns ===
+    hourly_patterns = (
+        lmp_df
+        .filter(col("point_type") == "Hub")  # Focus on hubs for pattern analysis
+        .groupBy("settlement_point", "hour_of_day")
+        .agg(
+            avg("lmp_price").alias("avg_price"),
+            spark_min("lmp_price").alias("min_price"),
+            spark_max("lmp_price").alias("max_price"),
+            expr("percentile(lmp_price, 0.1)").alias("p10_price"),
+            expr("percentile(lmp_price, 0.5)").alias("median_price"),
+            expr("percentile(lmp_price, 0.9)").alias("p90_price"),
+            stddev("lmp_price").alias("stddev_price"),
+            count("*").alias("observation_count")
+        )
+    )
+    
+    (
+        hourly_patterns
+        .write
+        .format("delta")
+        .mode("overwrite")
+        .option("overwriteSchema", "true")
+        .saveAsTable(f"{CATALOG}.{SCHEMA_GOLD}.lmp_hourly_patterns")
+    )
+    
+    print(f"✓ Created {CATALOG}.{SCHEMA_GOLD}.lmp_hourly_patterns")
+
+
+def create_lmp_hub_comparison():
+    """
+    Create hub-to-hub price comparison and spread analysis.
+    
+    Useful for:
+    - Identifying congestion patterns
+    - Trading strategy development
+    - Basis risk analysis
+    """
+    
+    lmp_df = spark.table(f"{CATALOG}.{SCHEMA_SILVER}.lmp_day_ahead_market")
+    
+    # Get hub prices pivoted for comparison
+    hub_prices = (
+        lmp_df
+        .filter(col("point_type") == "Hub")
+        .select("interval_start", "delivery_date", "hour_of_day", "settlement_point", "lmp_price")
+    )
+    
+    # Pivot to get hubs as columns
+    hub_pivot = (
+        hub_prices
+        .groupBy("delivery_date", "hour_of_day")
+        .pivot("settlement_point")
+        .agg(first("lmp_price"))
+    )
+    
+    # Calculate common spreads (if hubs exist)
+    hub_cols = [c for c in hub_pivot.columns if c.startswith("HB_")]
+    
+    if "HB_HOUSTON" in hub_cols and "HB_WEST" in hub_cols:
+        hub_pivot = hub_pivot.withColumn(
+            "houston_west_spread",
+            col("HB_HOUSTON") - col("HB_WEST")
+        )
+    
+    if "HB_NORTH" in hub_cols and "HB_SOUTH" in hub_cols:
+        hub_pivot = hub_pivot.withColumn(
+            "north_south_spread",
+            col("HB_NORTH") - col("HB_SOUTH")
+        )
+    
+    hub_pivot = (
+        hub_pivot
+        .withColumn("year", year(col("delivery_date")))
+        .withColumn("month", month(col("delivery_date")))
+    )
+    
+    (
+        hub_pivot
+        .write
+        .format("delta")
+        .mode("overwrite")
+        .partitionBy("year", "month")
+        .option("overwriteSchema", "true")
+        .saveAsTable(f"{CATALOG}.{SCHEMA_GOLD}.lmp_hub_hourly_comparison")
+    )
+    
+    print(f"✓ Created {CATALOG}.{SCHEMA_GOLD}.lmp_hub_hourly_comparison")
+    
+    # === Daily spread summary ===
+    spread_cols = [c for c in hub_pivot.columns if "spread" in c]
+    if spread_cols:
+        agg_exprs = [
+            avg(c).alias(f"avg_{c}") for c in spread_cols
+        ] + [
+            spark_min(spread_cols[0]).alias(f"min_{spread_cols[0]}"),
+            spark_max(spread_cols[0]).alias(f"max_{spread_cols[0]}")
+        ]
+        
+        daily_spreads = (
+            hub_pivot
+            .groupBy("delivery_date")
+            .agg(*agg_exprs)
+            .withColumn("year", year(col("delivery_date")))
+            .withColumn("month", month(col("delivery_date")))
+        )
+        
+        (
+            daily_spreads
+            .write
+            .format("delta")
+            .mode("overwrite")
+            .partitionBy("year", "month")
+            .option("overwriteSchema", "true")
+            .saveAsTable(f"{CATALOG}.{SCHEMA_GOLD}.lmp_daily_spreads")
+        )
+        
+        print(f"✓ Created {CATALOG}.{SCHEMA_GOLD}.lmp_daily_spreads")
+
+
+def create_lmp_volatility_metrics():
+    """
+    Calculate price volatility metrics for risk analysis.
+    
+    Metrics:
+    - Rolling volatility (7-day, 30-day)
+    - Price spike frequency
+    - Extreme price events
+    """
+    
+    daily_stats = spark.table(f"{CATALOG}.{SCHEMA_GOLD}.lmp_daily_statistics")
+    
+    # Focus on main hubs
+    hub_daily = daily_stats.filter(col("point_type") == "Hub")
+    
+    # Add rolling volatility
+    window_7d = Window.partitionBy("settlement_point").orderBy("date").rowsBetween(-6, 0)
+    window_30d = Window.partitionBy("settlement_point").orderBy("date").rowsBetween(-29, 0)
+    
+    volatility_df = (
+        hub_daily
+        .withColumn("rolling_7d_avg", avg("avg_price").over(window_7d))
+        .withColumn("rolling_7d_stddev", stddev("avg_price").over(window_7d))
+        .withColumn("rolling_30d_avg", avg("avg_price").over(window_30d))
+        .withColumn("rolling_30d_stddev", stddev("avg_price").over(window_30d))
+        
+        # Coefficient of variation (volatility normalized by mean)
+        .withColumn("cv_7d", col("rolling_7d_stddev") / col("rolling_7d_avg") * 100)
+        .withColumn("cv_30d", col("rolling_30d_stddev") / col("rolling_30d_avg") * 100)
+        
+        # Price spike indicator (price > 2x 30-day average)
+        .withColumn("is_price_spike", col("max_price") > (col("rolling_30d_avg") * 2))
+        
+        # Extreme price indicator (any hour > $100 or < $0)
+        .withColumn("has_extreme_high", col("max_price") > 100)
+        .withColumn("has_negative_price", col("min_price") < 0)
+    )
+    
+    (
+        volatility_df
+        .write
+        .format("delta")
+        .mode("overwrite")
+        .partitionBy("year", "month")
+        .option("overwriteSchema", "true")
+        .saveAsTable(f"{CATALOG}.{SCHEMA_GOLD}.lmp_volatility_metrics")
+    )
+    
+    print(f"✓ Created {CATALOG}.{SCHEMA_GOLD}.lmp_volatility_metrics")
+
+
+def create_lmp_renewable_correlation():
+    """
+    Analyze correlation between renewable generation and LMP prices.
+    
+    Key insights:
+    - How do high wind/solar periods affect prices?
+    - Price impact of renewable curtailment
+    - Negative price events and renewable generation
+    """
+    
+    # Join LMP with renewable generation
+    lmp_df = spark.table(f"{CATALOG}.{SCHEMA_SILVER}.lmp_day_ahead_market")
+    
+    # Get hub prices (use Houston as reference)
+    hub_lmp = (
+        lmp_df
+        .filter(col("settlement_point").like("%HOUSTON%"))
+        .select(
+            col("interval_start"),
+            col("delivery_date"),
+            col("hour_of_day"),
+            col("lmp_price").alias("houston_lmp")
+        )
+    )
+    
+    try:
+        renewable_df = spark.table(f"{CATALOG}.{SCHEMA_SILVER}.renewable_generation_totals")
+        
+        # Join on interval
+        combined = (
+            hub_lmp
+            .join(
+                renewable_df.select(
+                    "interval_start",
+                    "total_actual_mw",
+                    "solar_actual_mw",
+                    "wind_actual_mw",
+                    "total_curtailment_mw"
+                ),
+                on="interval_start",
+                how="inner"
+            )
+        )
+        
+        # Aggregate by day
+        daily_correlation = (
+            combined
+            .groupBy("delivery_date")
+            .agg(
+                avg("houston_lmp").alias("avg_lmp"),
+                avg("total_actual_mw").alias("avg_renewable_mw"),
+                avg("solar_actual_mw").alias("avg_solar_mw"),
+                avg("wind_actual_mw").alias("avg_wind_mw"),
+                avg("total_curtailment_mw").alias("avg_curtailment_mw"),
+                
+                # Count negative price hours
+                spark_sum(when(col("houston_lmp") < 0, 1).otherwise(0)).alias("negative_price_hours"),
+                
+                count("*").alias("hours_count")
+            )
+            .withColumn("year", year(col("delivery_date")))
+            .withColumn("month", month(col("delivery_date")))
+        )
+        
+        (
+            daily_correlation
+            .write
+            .format("delta")
+            .mode("overwrite")
+            .partitionBy("year", "month")
+            .option("overwriteSchema", "true")
+            .saveAsTable(f"{CATALOG}.{SCHEMA_GOLD}.lmp_renewable_correlation")
+        )
+        
+        print(f"✓ Created {CATALOG}.{SCHEMA_GOLD}.lmp_renewable_correlation")
+        
+    except Exception as e:
+        print(f"⚠ Could not create renewable correlation (renewable data may not exist): {e}")
+
+# COMMAND ----------
+
+# MAGIC %md
 # MAGIC ## Execute Gold Transformations
 
 # COMMAND ----------
@@ -567,6 +874,26 @@ try:
     create_ml_features()
 except Exception as e:
     print(f"✗ ML features failed: {e}")
+
+try:
+    create_lmp_price_statistics()
+except Exception as e:
+    print(f"✗ LMP price statistics failed: {e}")
+
+try:
+    create_lmp_hub_comparison()
+except Exception as e:
+    print(f"✗ LMP hub comparison failed: {e}")
+
+try:
+    create_lmp_volatility_metrics()
+except Exception as e:
+    print(f"✗ LMP volatility metrics failed: {e}")
+
+try:
+    create_lmp_renewable_correlation()
+except Exception as e:
+    print(f"✗ LMP renewable correlation failed: {e}")
 
 print("="*60)
 print("Gold transformations complete!")
@@ -617,3 +944,49 @@ print("Gold transformations complete!")
 # MAGIC   ROUND(total_curtailment_mwh / 1000, 1) as curtailment_gwh
 # MAGIC FROM ercot_energy.gold.generation_monthly_summary
 # MAGIC ORDER BY year DESC, month DESC
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC -- LMP Daily Statistics by Hub
+# MAGIC SELECT 
+# MAGIC   date,
+# MAGIC   settlement_point,
+# MAGIC   ROUND(avg_price, 2) as avg_price,
+# MAGIC   ROUND(min_price, 2) as min_price,
+# MAGIC   ROUND(max_price, 2) as max_price,
+# MAGIC   ROUND(peak_offpeak_spread, 2) as peak_offpeak_spread
+# MAGIC FROM ercot_energy.gold.lmp_daily_statistics
+# MAGIC WHERE point_type = 'Hub'
+# MAGIC ORDER BY date DESC, settlement_point
+# MAGIC LIMIT 50
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC -- LMP Hourly Price Patterns by Hub
+# MAGIC SELECT 
+# MAGIC   settlement_point,
+# MAGIC   hour_of_day,
+# MAGIC   ROUND(avg_price, 2) as avg_price,
+# MAGIC   ROUND(p10_price, 2) as p10_price,
+# MAGIC   ROUND(p90_price, 2) as p90_price,
+# MAGIC   observation_count
+# MAGIC FROM ercot_energy.gold.lmp_hourly_patterns
+# MAGIC ORDER BY settlement_point, hour_of_day
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC -- Price Volatility Analysis
+# MAGIC SELECT 
+# MAGIC   date,
+# MAGIC   settlement_point,
+# MAGIC   ROUND(avg_price, 2) as avg_price,
+# MAGIC   ROUND(rolling_7d_stddev, 2) as volatility_7d,
+# MAGIC   ROUND(cv_7d, 1) as cv_7d_pct,
+# MAGIC   is_price_spike,
+# MAGIC   has_negative_price
+# MAGIC FROM ercot_energy.gold.lmp_volatility_metrics
+# MAGIC WHERE date >= current_date() - 30
+# MAGIC ORDER BY date DESC, settlement_point

@@ -379,6 +379,167 @@ def transform_wind_regional():
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC ## LMP Day-Ahead Market - Clean and Enrich
+
+# COMMAND ----------
+
+def transform_lmp_dam():
+    """
+    Transform bronze LMP Day-Ahead Market data to silver.
+    
+    Key transformations:
+    - Standardize column names
+    - Parse settlement point types (Hub, Load Zone, Resource Node)
+    - Add time-based features
+    - Calculate price statistics
+    """
+    
+    bronze_df = spark.table(f"{CATALOG}.{SCHEMA_BRONZE}.lmp_day_ahead_market")
+    
+    # Check actual columns in the data
+    print(f"Bronze LMP DAM columns: {bronze_df.columns}")
+    
+    silver_df = (
+        bronze_df
+        # Standardize column names - adjust based on actual column names
+        .withColumnRenamed("Interval_Start", "interval_start")
+        .withColumnRenamed("Interval_End", "interval_end")
+        .withColumnRenamed("Location", "settlement_point")
+        .withColumnRenamed("Location_Type", "settlement_point_type")
+        .withColumnRenamed("LMP", "lmp_price")
+        
+        # Add time-based features
+        .withColumn("delivery_date", col("interval_start").cast("date"))
+        .withColumn("hour_ending", hour(col("interval_end")))
+        .withColumn("hour_of_day", hour(col("interval_start")))
+        .withColumn("day_of_week", date_format(col("interval_start"), "EEEE"))
+        .withColumn("is_weekend", when(date_format(col("interval_start"), "E").isin("Sat", "Sun"), True).otherwise(False))
+        .withColumn("is_peak_hour", when((hour(col("interval_start")) >= 7) & (hour(col("interval_start")) < 22), True).otherwise(False))
+        
+        # Classify settlement point type if not already present
+        .withColumn(
+            "point_type",
+            when(col("settlement_point").like("%HB_%"), "Hub")
+            .when(col("settlement_point").like("%LZ_%"), "Load Zone")
+            .when(col("settlement_point").like("%ZONE%"), "Load Zone")
+            .otherwise("Resource Node")
+        )
+        
+        # Add metadata
+        .withColumn("_transformed_at", current_timestamp())
+        .withColumn("_source_table", lit(f"{CATALOG}.{SCHEMA_BRONZE}.lmp_day_ahead_market"))
+        
+        # Partition columns
+        .withColumn("year", year(col("interval_start")))
+        .withColumn("month", month(col("interval_start")))
+        .withColumn("day", dayofmonth(col("interval_start")))
+    )
+    
+    # Write to silver
+    (
+        silver_df
+        .write
+        .format("delta")
+        .mode("overwrite")
+        .partitionBy("year", "month")
+        .option("overwriteSchema", "true")
+        .saveAsTable(f"{CATALOG}.{SCHEMA_SILVER}.lmp_day_ahead_market")
+    )
+    
+    print(f"✓ Wrote {silver_df.count():,} rows to {CATALOG}.{SCHEMA_SILVER}.lmp_day_ahead_market")
+    return silver_df
+
+
+def create_lmp_hub_summary():
+    """
+    Create a summary view of LMP prices by hub.
+    
+    Focuses on the main trading hubs which are most commonly referenced:
+    - HB_HOUSTON (Houston Hub)
+    - HB_NORTH (North Hub)
+    - HB_SOUTH (South Hub) 
+    - HB_WEST (West Hub)
+    - HB_PAN (Panhandle Hub)
+    """
+    
+    silver_df = spark.table(f"{CATALOG}.{SCHEMA_SILVER}.lmp_day_ahead_market")
+    
+    # Filter to just hubs
+    hub_df = silver_df.filter(col("point_type") == "Hub")
+    
+    # Daily hub prices
+    daily_hub_prices = (
+        hub_df
+        .groupBy("delivery_date", "settlement_point")
+        .agg(
+            avg("lmp_price").alias("avg_lmp"),
+            spark_min("lmp_price").alias("min_lmp"),
+            spark_max("lmp_price").alias("max_lmp"),
+            expr("percentile(lmp_price, 0.5)").alias("median_lmp"),
+            (spark_max("lmp_price") - spark_min("lmp_price")).alias("price_spread"),
+            count("*").alias("hours_count")
+        )
+        .withColumn("year", year(col("delivery_date")))
+        .withColumn("month", month(col("delivery_date")))
+    )
+    
+    (
+        daily_hub_prices
+        .write
+        .format("delta")
+        .mode("overwrite")
+        .partitionBy("year", "month")
+        .option("overwriteSchema", "true")
+        .saveAsTable(f"{CATALOG}.{SCHEMA_SILVER}.lmp_hub_daily_summary")
+    )
+    
+    print(f"✓ Created {CATALOG}.{SCHEMA_SILVER}.lmp_hub_daily_summary")
+
+
+def create_lmp_load_zone_summary():
+    """
+    Create a summary view of LMP prices by load zone.
+    
+    Load zones represent the major demand areas in ERCOT:
+    - LZ_HOUSTON, LZ_NORTH, LZ_SOUTH, LZ_WEST
+    """
+    
+    silver_df = spark.table(f"{CATALOG}.{SCHEMA_SILVER}.lmp_day_ahead_market")
+    
+    # Filter to load zones
+    lz_df = silver_df.filter(col("point_type") == "Load Zone")
+    
+    # Daily load zone prices
+    daily_lz_prices = (
+        lz_df
+        .groupBy("delivery_date", "settlement_point")
+        .agg(
+            avg("lmp_price").alias("avg_lmp"),
+            spark_min("lmp_price").alias("min_lmp"),
+            spark_max("lmp_price").alias("max_lmp"),
+            expr("percentile(lmp_price, 0.5)").alias("median_lmp"),
+            (spark_max("lmp_price") - spark_min("lmp_price")).alias("daily_price_range"),
+            count("*").alias("hours_count")
+        )
+        .withColumn("year", year(col("delivery_date")))
+        .withColumn("month", month(col("delivery_date")))
+    )
+    
+    (
+        daily_lz_prices
+        .write
+        .format("delta")
+        .mode("overwrite")
+        .partitionBy("year", "month")
+        .option("overwriteSchema", "true")
+        .saveAsTable(f"{CATALOG}.{SCHEMA_SILVER}.lmp_load_zone_daily_summary")
+    )
+    
+    print(f"✓ Created {CATALOG}.{SCHEMA_SILVER}.lmp_load_zone_daily_summary")
+
+# COMMAND ----------
+
 # Run all silver transformations
 print("Starting Silver layer transformations...")
 print("="*60)
@@ -407,6 +568,21 @@ try:
     transform_wind_regional()
 except Exception as e:
     print(f"✗ Wind regional transform failed: {e}")
+
+try:
+    transform_lmp_dam()
+except Exception as e:
+    print(f"✗ LMP DAM transform failed: {e}")
+
+try:
+    create_lmp_hub_summary()
+except Exception as e:
+    print(f"✗ LMP hub summary failed: {e}")
+
+try:
+    create_lmp_load_zone_summary()
+except Exception as e:
+    print(f"✗ LMP load zone summary failed: {e}")
 
 print("="*60)
 print("Silver transformations complete!")
