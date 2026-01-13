@@ -135,6 +135,99 @@ Run: 03_gold_aggregations.py
 | `01_bronze_ingestion.py` | Extract data from ERCOT API to bronze tables |
 | `02_silver_transformations.py` | Clean and standardize data |
 | `03_gold_aggregations.py` | Create analytics and ML feature tables |
+| `test_01_bronze_ingestion.py` | Integration tests for bronze layer functions |
+
+## Testing
+
+### Test Coverage
+
+The project includes integration tests for the bronze layer that validate critical data ingestion functions. Tests are designed to run manually in Databricks using an isolated test catalog.
+
+**Test Notebook**: `test_01_bronze_ingestion.py`
+
+### What's Tested
+
+The bronze layer tests cover these critical functions:
+
+1. **`table_exists()`** - Table detection logic
+   - Validates correct detection of existing tables
+   - Handles non-existent tables appropriately
+   - Tests catalog and schema resolution
+
+2. **`determine_load_dates()`** - Incremental load date calculation
+   - Initial load scenario (uses default start date)
+   - Incremental load scenario (calculates lookback from last load)
+   - Custom lookback period handling
+   - Late-arriving data support
+
+3. **`write_to_bronze()`** - Data writing and partitioning
+   - Partition column generation (year, month, day)
+   - Timestamp extraction from Interval_Start/Time columns
+   - Append vs overwrite modes
+   - Metadata column preservation
+   - Schema merging
+
+4. **`run_bronze_quality_checks()`** - Data quality validation
+   - Row count verification
+   - Null value detection (timestamps, metadata)
+   - Duplicate interval identification
+   - Date range validation
+   - Empty table handling
+
+### Running Tests
+
+**Prerequisites:**
+- Databricks workspace with Unity Catalog enabled
+- Cluster attached to workspace
+- No special permissions required (test catalog is isolated)
+
+**Steps:**
+
+1. Upload `test_01_bronze_ingestion.py` to your Databricks workspace
+2. Attach the notebook to any cluster
+3. Run all cells
+
+The tests will:
+- Create an isolated test catalog: `ercot_energy_test`
+- Execute all 4 test suites
+- Print detailed results for each test (✅ pass / ❌ fail)
+- Clean up test tables automatically after each test
+- Display a summary of all test results
+
+**Test Output Example:**
+```
+Running Test 1: table_exists()
+------------------------------------------------------------
+  ✓ Non-existent table correctly returns False
+  ✓ Created test table: ercot_energy_test.bronze.test_exists_table
+  ✓ Existing table correctly returns True
+  ✓ Cleaned up test table
+
+✅ Test 1 PASSED: table_exists() works correctly
+```
+
+### Test Environment
+
+- **Test Catalog**: `ercot_energy_test`
+- **Test Schema**: `bronze`
+- **Isolation**: Tests never touch production or dev tables
+- **Cleanup**: Optional command to drop entire test catalog when done
+
+To remove the test catalog after testing:
+```sql
+DROP CATALOG IF EXISTS ercot_energy_test CASCADE;
+```
+
+### Test Approach
+
+These are **integration tests** that:
+- Run in actual Databricks environment (not unit tests)
+- Use real Spark DataFrames and Delta tables
+- Test against Unity Catalog
+- Validate end-to-end functionality
+- Can be run manually as needed (not automated CI/CD)
+
+This approach is suitable for POC/development environments where manual validation is sufficient.
 
 ## Data Sources
 
